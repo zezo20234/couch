@@ -1,25 +1,72 @@
-name: Build APK
+# Builds the TV home on every push and, on the main branch, publishes it as a GitHub release.
+# The launcher's "Check for updates" button reads the newest release of zezo20234/couch and
+# installs couch-tv-home.apk from it, so the file name below must stay as it is.
+#
+# Every release is signed with the same key (.github/signing/couch.keystore.b64), because Android
+# only lets an app update itself when the new file carries the key of the one already installed.
+# To use a private key instead, add a repository secret named DEBUG_KEYSTORE (base64 of the
+# keystore, alias androiddebugkey, password android); the secret wins when it is set.
+name: Build and release
+
 on:
   push:
-    branches: ["**"]
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: "21"
+
+      - name: Android platform 34
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Signing key
+        env:
+          DEBUG_KEYSTORE: ${{ secrets.DEBUG_KEYSTORE }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE" ]; then
+            printf '%s' "$DEBUG_KEYSTORE" | base64 -d > "$RUNNER_TEMP/ci.keystore"
+          else
+            base64 -d .github/signing/couch.keystore.b64 > "$RUNNER_TEMP/ci.keystore"
+          fi
+          echo "COUCHTV_KEYSTORE=$RUNNER_TEMP/ci.keystore" >> "$GITHUB_ENV"
+
+      - name: Build the TV home (tries again if a download server says too many requests)
+        env:
+          HOME_ONLY: "1"
+          UPDATE_REPO: zezo20234/couch
+        run: |
+          export VERSION_CODE=$((1000 + GITHUB_RUN_NUMBER))
+          export VERSION_NAME="0.12.${GITHUB_RUN_NUMBER}"
+          for i in 1 2 3; do
+            sh scripts/build-apk.sh && exit 0
+            echo "Attempt $i failed, waiting 60 seconds..."
+            sleep 60
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v4
         with:
-          gradle-version: "8.7"
-      - run: gradle assembleDebug --no-daemon
-      - run: cp app/build/outputs/apk/debug/app-debug.apk tvhome.apk
+          name: couch-tv-home
+          path: dist/couch-tv-home.apk
+          if-no-files-found: error
+
       - name: Publish release
+        if: github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "build-${{ github.run_number }}" tvhome.apk --title "TV Home build ${{ github.run_number }}" --notes "Newest build" --latest
+        run: |
+          gh release create "v0.12.${GITHUB_RUN_NUMBER}" dist/couch-tv-home.apk \
+            --target "$GITHUB_SHA" \
+            --title "Couch TV home 0.12.${GITHUB_RUN_NUMBER}" \
+            --notes "Ports you can rename, red Delete button, updates from this repo." \
+            --latest
